@@ -171,54 +171,95 @@ class MLNEB(object):
                                                 trj['images'],
                                                 trj['constraints'],
                                                 trj['num_atoms']]
-        self.ase_ini = read(start)
+        '''
+        trj 是 ase_to_catlearn(...) 的返回值（字典）。这里把字典里的关键字段拆出来并赋给实例属性：
+        list_train：用于训练 GP 的特征/输入（通常每个 entry 对应一个结构）
+        list_targets：对应的能量（label）列表
+        list_gradients：对应的力/梯度（若 GP 训练同时使用力信息）
+        trj_images：原始帧列表（或 Atoms 列表）
+        constraints：若原子上存在约束（fixed atoms 等），会作为结构信息返回
+        num_atoms：每帧的原子数（或在特征转换时记录的值）
+        '''
+
+
+        
+         
+        self.ase_ini = read(start) # 读取 start 作为 ASE 对象，设置原子数
         self.num_atoms = len(self.ase_ini)
         if len(self.constraints) < 0:
             self.constraints = None
         if self.constraints is not None:
-            self.index_mask = create_mask(self.ase_ini, self.constraints)
+            self.index_mask = create_mask(self.ase_ini, self.constraints) # 该函数通常根据 Atoms 和约束信息返回一个布尔或整型索引掩码，标记哪些原子被固定、哪些自由，从而在训练/预测时忽略受约束的自由度。
 
         # Obtain the energy of the endpoints for scaling:
         self.energy_is = is_endpoint[-1].get_potential_energy(
                                                       force_consistent=self.fc)
         self.energy_fs = fs_endpoint[-1].get_potential_energy(
                                                       force_consistent=self.fc)
+        '''
+        get_potential_energy 是 ASE Atoms 的接口，会把请求转发给分配给该 Atoms 的 Calculator 来实际计算或读值。
+        force_consistent=self.fc 是把“希望使用与力一致的能量”这一意图以关键字参数传给 Calculator；是否生效、如何实现、返回哪个字段，都是由具体 Calculator/wrapper 决定的 —— 因此在代码中需要做检查或优雅回退。
+        ---
+        【作用】：取起点（initial）和终点（final）的能量值并保存。get_potential_energy 会触发计算器返回能量（如果已经计算过可能从缓存读），force_consistent=self.fc 控制是否取“与力一致”的能量（之前你问过这个）；self.fc 的含义：True 强制用力一致能量，None 则在计算器支持时使用，否则退回普通能量。
+        【目的】：下面会用端点能量来**归一化/缩放（scaling）**训练目标（targets），便于 ML 模型稳定训练或把不同能量尺度标准化。
+        '''
 
         # Set scaling of the targets:
-        self.max_targets = np.max([self.energy_is, self.energy_fs])
+        self.max_targets = np.max([self.energy_is, self.energy_fs]) # 作用：取两个端点能量的最大值作为 max_targets。通常用于把所有训练能量除以该值或做相对缩放（代码中传给 create_ml_neb 的 scaling_targets 参数）。
+        '''
+        作用：取两个端点能量的最大值作为 max_targets。通常用于把所有训练能量除以该值或做相对缩放（代码中传给 create_ml_neb 的 scaling_targets 参数）。
+        理由：ML 回归对目标尺度敏感，把能量按端点尺度归一化可以让训练更稳定、超参数更易设定，也便于把不同体系做统一处理。注意：若端点能量为负（常见），max 可能也是负数 —— 需看 create_ml_neb 如何使用它（可能用绝对值或平移），这点要留意。
+        '''
 
+                   
         # Settings for the NEB.
-        self.neb_method = neb_method
-        self.spring = k
-        self.initial_endpoint = is_endpoint[-1]
+        self.neb_method = neb_method                  # neb_method：保存你选择的 NEB 算法（如 'improvedtangent'）。
+        self.spring = k                               # 弹簧常数（k），用于 NEB 中相邻图片间弹簧力的标量；此处先保存用户输入（可能为 None，接下来会自动设置默认值）。
+        self.initial_endpoint = is_endpoint[-1]       # initial_endpoint/final_endpoint：把 Atoms 端点对象保存到实例中，后续用于插值与创建 images。
         self.final_endpoint = fs_endpoint[-1]
 
         # A) Create images using interpolation if user do not feed a path:
         if path is None:
-            self.d_start_end = np.abs(distance.euclidean(is_pos, fs_pos))
+            self.d_start_end = np.abs(distance.euclidean(is_pos, fs_pos)) # is_pos 和 fs_pos 是之前展平的一维坐标向量（长度 = 3 × N_atoms）。distance.euclidean 计算它们的欧氏距离，返回单个标量，代表“端点坐标向量在高维 3N 空间的欧氏距离”——这常被当作路径长度的近似。
+            '''
+            注意：这个“路径长度”是基于所有原子坐标的一维范数，不是质心间距或最大原子位移；在原子数很多时，这个数会比较大。若体系为 PBC，需要先用 MIC（最小镜像约定）调整坐标，否则距离可能被盒子边界“拉大”
+            '''
+          
             if isinstance(self.n_images, float):
-                self.n_images = int(self.d_start_end/self.n_images)
-                if self. n_images <= 3:
+                self.n_images = int(self.d_start_end/self.n_images) # 当 n_images 原本被用作“间距（Å）”的浮点数时，代码把实际所需镜像数计算为xxxx
+                if self.n_images <= 3:
                     self.n_images = 3
-            if self.spring is None:
+            if self.spring is None: # 自动设置弹簧常数（如果用户未给）
+                '''             
+                若用户未显式给 k（弹簧常数），代码使用这个经验公式来给一个默认值：sqrt((n_images - 1) / d_start_end)。
+                解释：弹簧常数的单位与定义依赖实现，这个公式试图让“总弹簧刚度”随段数和路径长度调整，以便弹簧力在不同图像数或不同路径长度下保持某种尺度。
+                注意：该公式对 d_start_end 非常依赖，若 d_start_end 接近 0 将导致除以 0 或数值不稳定（需防护）。
+                物理上弹簧常数 k 单位（能量/距离²）与这里用的表达可能仅为启发式，实际需要用经验或调参得到较好收敛性
+                '''
                 self.spring = np.sqrt((self.n_images-1) / self.d_start_end)
-            self.images = create_ml_neb(is_endpoint=self.initial_endpoint,
+              
+            # 调用 create_ml_neb 生成 images（包含 ML 相关参数），返回的 self.images 很可能是 list[Atoms]
+            # create_ml_neb：这是 CatLearn 的函数，用来创建一系列 Atoms images 作为 NEB 的初始路径
+            self.images = create_ml_neb(is_endpoint=self.initial_endpoint, # 这里 create_ml_neb 的参数名恰好叫 is_endpoint，但那只是函数的形参名字。你把 self.initial_endpoint（一个 Atoms）传进去，函数内部会把这个 Atoms 用作起点。 参数名的重复并不冲突：调用时 is_endpoint= 左边是形参名，右边是你传进去的值（这里是 self.initial_endpoint）。这在 Python 里非常常见。
                                         fs_endpoint=self.final_endpoint,
-                                        images_interpolation=None,
-                                        n_images=self.n_images,
-                                        constraints=self.constraints,
-                                        index_constraints=self.index_mask,
-                                        scaling_targets=self.max_targets,
-                                        iteration=self.iter,
+                                        images_interpolation=None,         # 指示使用内部默认插值（下一步会用 ASE 的 NEB.interpolate）
+                                        n_images=self.n_images,            # 前面得到的镜像数（包含端点还是仅中间？依实现而定；通常是包含端点）
+                                        constraints=self.constraints,      # 若有固定原子，需传入以保证插值不改变受限坐标。
+                                        index_constraints=self.index_mask, 
+                                        scaling_targets=self.max_targets,  # 把端点能量尺度传进去，可能用于对能量目标做归一化或将能量平移到更合适的训练范围。
+                                        iteration=self.iter,               # iteration=self.iter：把当前迭代数传给创建函数（可能用于命名或调试信息）
                                         )
 
-            neb_interpolation = NEB(self.images, k=self.spring)
-
-            neb_interpolation.interpolate(method=interpolation, mic=self.mic)
+            neb_interpolation = NEB(self.images, k=self.spring) # 把生成的 self.images 交给 ASE 的 NEB 对象（临时用于做插值），传入 k=self.spring（弹簧常数）。
+            neb_interpolation.interpolate(method=interpolation, mic=self.mic) # 调用插值，method 可为 'linear' 或 'idpp'；mic=self.mic 表示在插值时是否启用最小镜像约定（PBC 情形下按最近镜像插值）
+            '''
+            最终结果会把 self.images（或 neb_interpolation 内部的 images）调整为插值后的结构，作为后续 ML-NEB 迭代的初始路径。
+            '''
 
         # B) If the user sets a path:
         if path is not None:
-            images_path = read(path, ':')
+            images_path = read(path, ':') # 读取该轨迹文件的所有帧，images_path 将是 list[Atoms]（轨迹的每一帧）
+            # 轨迹的“帧”＝ASE 的 Atoms；在 NEB 上下文中这些 Atoms 就被称为“images”
 
             if not np.array_equal(images_path[0].get_positions().flatten(),
                                   is_pos):
