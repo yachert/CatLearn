@@ -267,6 +267,11 @@ class MLNEB(object):
             if not np.array_equal(images_path[-1].get_positions().flatten(),
                                   fs_pos):
                 images_path.append(self.final_endpoint)
+            '''
+            确保 images_path 的首尾确实是你传入的 start / end。
+            np.array_equal(...) 比较首帧的位置向量与 is_pos（之前从 start 得到的扁平向量）；如果不相等，就把 initial_endpoint 插入到列表开头。
+            同理确保最后一帧等于 final_endpoint，如果没有则 append。
+            '''
 
             self.n_images = len(images_path)
             self.images = create_ml_neb(is_endpoint=self.initial_endpoint,
@@ -281,27 +286,40 @@ class MLNEB(object):
             self.d_start_end = np.abs(distance.euclidean(is_pos, fs_pos))
 
         # Save files with all the paths that have been predicted:
-
+        '''
+        意思：把当前 self.images（list of Atoms）写到 all_predicted_paths.traj 文件，以便后续查看、重启或调试。
+        注意：固定文件名会覆盖旧文件，建议在并行或多次运行时使用唯一文件名或让用户传入文件名参数。
+        '''
         write('all_predicted_paths.traj', self.images)
+        
+        self.uncertainty_path = np.zeros(len(self.images)) # 为每张 image 初始化一个不确定性数组 uncertainty_path，长度等于 images 数量，初始全 0。后续 GP 会填入每张 image 的不确定性估计，用于决策要在哪张 image 上做真实计算（active learning）。
 
-        self.uncertainty_path = np.zeros(len(self.images))
-
-        # Guess spring constant if spring was not set by the user:
+        # Guess spring constant if spring was not set by the user: 弹簧常数二次检查（如果之前没设）
         if self.spring is None:
             self.spring = np.sqrt(self.n_images-1) / self.d_start_end
 
         # Get initial path distance:
-        self.path_distance = self.d_start_end.copy()
+        self.path_distance = self.d_start_end.copy() # 把初始路径长度 d_start_end 复制到 self.path_distance，作为路径长度的记录
 
-        # Get forces for the previous steps
+        # Get forces for the previous steps 计算之前已评估结构的 forces 的 fmax（最大力）
+        '''
+        意思：遍历 self.list_gradients（之前通过 ase_to_catlearn 得到的梯度/力列表），计算每个梯度条目的 fmax（通常是每结构的最大原子力大小），并把这些 max_abs_forces 存入 self.list_max_abs_forces。
+        变量/函数说明：
+        self.list_gradients：应该是一个列表，每个元素代表一image的力（可能是 shape (N_atoms, 3) 或已扁平化的向量）。
+        get_fmax(...)：常见的辅助函数，接收力数组并返回每帧的 fmax（可能返回标量或数组，取决于实现）。
+        np.max(np.abs(...))：对 get_fmax 的返回取绝对值并再取最大，确保得到正数标量。
+        注意/潜在问题：
+        代码把 get_fmax(np.array([i])) 的结果赋给 self.list_fmax（实例属性）——这会被循环覆盖（只保留最后一个值）。如果 list_fmax 期望保存所有 fmax，那这里应该用局部变量并 append；但当前逻辑又把 max_abs_forces append 到 list_max_abs_forces，意味着 self.list_fmax 可能只做临时变量而误用了实例属性名。
+        '''
         self.list_max_abs_forces = []
-        for i in self.list_gradients:
+        for i in self.list_gradients: # self.list_gradients（每个元素对应一个 image 的梯度/力数组）
                 self.list_fmax = get_fmax(np.array([i]))
                 self.max_abs_forces = np.max(np.abs(self.list_fmax))
                 self.list_max_abs_forces.append(self.max_abs_forces)
 
         print_info_neb(self)
-
+                   
+    # ==================================================
     def run(self, fmax=0.05, unc_convergence=0.050, steps=500,
             trajectory='ML_NEB_catlearn.traj', acquisition='acq_5',
             dt=0.025, ml_steps=750, max_step=0.25, sequential=False,
