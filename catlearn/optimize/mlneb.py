@@ -88,8 +88,11 @@ class MLNEB(object):
         self.start = start
         self.end = end
         self.n_images = n_images
-        self.feval = 0
-
+        self.feval = 0 
+        '''
+        “function evaluations” 或 “force/energy evaluations” 的计数器。初始化为 0，后续每次调用真实计算（ASE calculator）得到能量/力时应把它增加。
+        用途：用于统计已做了多少次昂贵的真实计算，常用于主动学习、成本控制和日志输出。
+        '''
         # General setup.
         self.fc = force_consistent
         self.iter = 0
