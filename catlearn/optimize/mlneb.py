@@ -94,9 +94,9 @@ class MLNEB(object):
         用途：用于统计已做了多少次昂贵的真实计算，常用于主动学习、成本控制和日志输出。
         '''
         # General setup.
-        self.fc = force_consistent
-        self.iter = 0
-        self.ase_calc = ase_calc
+        self.fc = force_consistent    # 使用与力一致的能量（energy that is consistent with forces）；
+        self.iter = 0                 # 迭代计数器，表示 ML-NEB 主循环已执行多少次（例如每次选取新 image 做真实计算并更新 GP 就增加一次）。
+        self.ase_calc = ase_calc      # 把用户传入的 ASE 计算器对象（如 GPAW、VASP wrapper、或其它 Calculator）保存到实例。后续执行真实能量/力计算时会用到这个对象，或在创建/恢复 images 时分配给每个 image。
         self.ase = True
         self.mic = mic
         self.version = 'ML-NEB ' + __version__
@@ -105,32 +105,49 @@ class MLNEB(object):
 
         # Reset.
         self.constraints = None
-        self.interesting_point = None
+        self.interesting_point = None # 清除“有趣点”记录（例如上一次选出的采样点或过渡态猜测），为新的主动学习循环重置。
         self.acq = None
-        self.gp = None
+        self.gp = None                # 清除/释放先前的 Gaussian Process 模型实例（如果存在），准备重新构建或初始化 GP。
 
         msg = 'Error: Initial structure for the NEB was not provided.'
         assert start is not None, msg
         msg = 'Error: Final structure for the NEB was not provided.'
         assert end is not None, msg
         msg = 'ASE calculator not provided (see "ase_calc" flag).'
-        assert self.ase_calc, msg
+        assert self.ase_calc, msg                          # 确保提供了 ASE 计算器对象（ase_calc），因为后续需要用它做真实能量/力计算。若没有提供就会断言失败并显示提示信息。
 
-        is_endpoint = read(start, '-1:')
+        is_endpoint = read(start, '-1:')                   # 这是一个list，返回一个只有最后一帧的列表（list of Atoms）
         fs_endpoint = read(end, '-1:')
-        is_pos = is_endpoint[-1].get_positions().flatten()
-        fs_pos = fs_endpoint[-1].get_positions().flatten()
+        is_pos = is_endpoint[-1].get_positions().flatten() # is_endpoint[-1] 取出最后一个 Atoms 对象
+        '''
+        取出读到的最后一帧 Atoms（is_endpoint[-1]），调用 .get_positions() 得到形状为 (N_atoms, 3) 的位置数组（每行 [x,y,z]）。
+        flatten() 把二维数组摊平成一维（长度为 3 * N_atoms），方便后续按一维向量做比较或计算范数（例如计算两端点之间的总位移或路径长度）
+        '''
+        fs_pos = fs_endpoint[-1].get_positions().flatten() 
 
         # Check the magnetic moments of the initial and final states:
+        '''
+        get_initial_magnetic_moments()：这是 ASE Atoms 对象的方法，用来返回每个原子在该 Atoms 对象上初始设置的磁矩（magmoms）。不是计算得到的磁矩，而是 Atoms 上的 magmoms 属性（常用来告诉计算器初始自旋）。
+        为什么保存：在处理含磁性的体系（例如铁、磁性过渡金属表面、吸附物带磁矩）时，起始态和终止态的磁矩分布可能不同。ML-NEB 需要知道这点来确保 ML 特征与后续计算使用一致的自旋/磁性设置（或者在遇到磁性翻转时采取特殊处理）。
+        实践中，这可以用来：检测 is 与 fs 是否具有不同的磁矩设置（若不同，可能需人为指定或处理自旋翻转的问题）。
+        '''
         self.magmom_is = is_endpoint[-1].get_initial_magnetic_moments()
         self.magmom_fs = fs_endpoint[-1].get_initial_magnetic_moments()
 
         # Convert atoms information into data to feed the ML process.
-
+        '''
+        注释处标明：将 Atoms（或轨迹）转换为供 CatLearn/GP 使用的数据结构（特征、目标、梯度等）。
+        ase_to_catlearn（在代码中调用）通常会：
+        遍历 Atoms（或轨迹文件里的每一帧），生成 ML 所需的特征向量/描述符（list_train）；
+        生成目标值（能量 list_targets）与梯度/力（list_gradients）；
+        返回附带 images（原子序列/traj frames）、constraints（约束信息）与 num_atoms 等信息的字典 trj。
+        '''
+                   
         # Include Restart mode and previous calculations.
-
+        # Restart / prev_calculations 逻辑（决定用哪些已评估结构作为训练集）
         if restart is not True:
-            merged_trajectory = is_endpoint + fs_endpoint
+            # 当 不要求重启（restart 非 True）时：直接把起点与终点合并为 merged_trajectory，转换为 ML 数据并写入文件 evaluated_structures.traj。也就是说从头开始，不读取旧的训练数据，而把当前端点作为已评估样本
+            merged_trajectory = is_endpoint + fs_endpoint 
             trj = ase_to_catlearn(merged_trajectory)
             write('./evaluated_structures.traj', is_endpoint + fs_endpoint)
 
