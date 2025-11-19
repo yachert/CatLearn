@@ -330,28 +330,34 @@ class MLNEB(object):
         Parameters
         ----------
         fmax : float
-            Convergence criteria (in eV/Angs).
+            Convergence criteria (in eV/Angs). 
+            真实计算/优化的力收敛阈值，单位 eV/Å（NEB/optimizer 用）。
         unc_convergence: float
-            Maximum uncertainty for convergence (in eV).
+            Maximum uncertainty for convergence (in eV). 
+            用于判定整体不确定性收敛的阈值（eV）
         steps : int
             Maximum number of iterations in the surrogate model.
         trajectory: string
             Filename to store the output.
         acquisition : string
-            Acquisition function.
+            Acquisition function. 
+            采集函数名称（决定用 GP 的哪个准则去选样本），在此方法前已保存在 self.acq
         dt : float
             dt parameter for MDMin.
-        ml_steps: int
+        ml_steps: int 
             Maximum number of steps for the NEB optimization on the
-            predicted landscape.
+            predicted landscape. 
+            在预测的（由 GP 提供的）势能面上做 NEB 优化时允许的最大步数（早停上限）
         max_step: float
             Early stopping criteria. Maximum uncertainty before stopping the
-            optimization in the predicted landscape.
+            optimization in the predicted landscape. 
+            在预测势能面上若不确定度超过此值就提前停止优化（安全阈值）
         sequential: boolean
             When sequential is set to True, the ML-NEB algorithm starts
             with only one moving image. After finding a saddle point
             the algorithm adds all the images selected in the MLNEB class
             (the total number of NEB images is defined in the 'n_images' flag).
+            True 表示逐步添加 image（先用 3 张 image 找 saddle，再加回完整数量），可节约计算但更复杂。
         full_output: boolean
             Whether to print on screen the full output (True) or not (False).
 
@@ -360,10 +366,18 @@ class MLNEB(object):
         Minimum Energy Path from the initial to the final states.
 
         """
-        self.acq = acquisition
-        self.fullout = full_output
+        self.acq = acquisition           # 把采集函数名与输出偏好保存到实例上，后面其他函数会读取 self.acq
+        self.fullout = full_output       # 是否打印详细日志（调试用）
 
         # Calculate a third point if only known initial & final structures.
+        '''
+        意图：如果只有两个训练点（start & end），GP 无法很好地拟合路径。于是选一个“interesting_point”（有可能是高能一侧靠近中部的位置）做一次真实能量/力评估并把结果添加到训练集（eval_and_append）。
+        middle 的计算依据端点能量大小决定偏向哪一侧：如果起点能量更高，选择更靠近起点的中间镜像（1/3）；否则偏向2/3。目的是尽早采样更有可能含 saddle 的一侧。
+        self.interesting_point 存的是所选 image 的坐标扁平向量。
+        eval_and_append(self, ...)：把点送去真实计算（ASE calculator），把能量/力结果加入 self.list_train, self.list_targets, self.list_gradients 等（函数内部完成调用 calculator、计数 feval、更新 train set）。
+        更新迭代计数 self.iter 和统计力 list_max_abs_forces，保存轨迹/打印信息。
+        注意：这一步是“主动学习”策略的第一次采样，确保 GP 有最少数量的训练点开始。
+        '''    
         if len(self.list_targets) == 2:
             middle = int(self.n_images * (2./3.))
             if self.energy_is >= self.energy_fs:
@@ -371,7 +385,10 @@ class MLNEB(object):
             self.interesting_point = \
                 self.images[middle].get_positions().flatten()
 
-            eval_and_append(self, self.interesting_point)
+            eval_and_append(self, self.interesting_point) # eval_and_append(self, ...)：把点送去真实计算（ASE calculator），把能量/力结果加入  \
+                                                          # self.list_train, self.list_targets, self.list_gradients 等 \
+                                                          # （函数内部完成调用 calculator、计数 feval、更新 train set）。
+
 
             self.iter += 1
             self.max_forces = get_fmax(np.array([self.list_gradients[-1]]))
@@ -381,9 +398,9 @@ class MLNEB(object):
 
             store_trajectory_neb(self)
 
-        stationary_point_found = False
+        stationary_point_found = False      # 后面用于知道是否发现了鞍点（saddle），以便在 sequential 模式下恢复完整 images 数。
 
-        org_n_images = self.n_images
+        org_n_images = self.n_images        # 保存用户原来期望的镜像数，以便在 sequential 模式临时改成 3 后能恢复。
 
         if sequential is True:
             self.n_images = 3
@@ -391,6 +408,11 @@ class MLNEB(object):
         while True:
 
             # 1. Train Machine Learning process.
+            '''
+            输入：当前训练集（结构特征 list）、目标能量、力、约束掩码、路径长度、是否打印完整输出。
+            输出：self.gp（训练好的 Gaussian Process 代理，用来预测任意 image 的能量/力与不确定度）与 self.max_target（用于缩放能量目标的数值，GP training 可能会返回归一化尺度或评估误差的最大值）。
+            这一步是 ML-NEB 的核心：更新代理模型使其能在路径上预测能量/力。
+            '''
             self.gp, self.max_target = \
                 train_gp_model(self.list_train, self.list_targets,
                                self.list_gradients, self.index_mask,
@@ -399,14 +421,16 @@ class MLNEB(object):
             # 2. Setup and run ML NEB:
             if self.fullout is True:
                 parprint('Max number steps:', ml_steps)
-            ml_cycles = 0
+            ml_cycles = 0      # 控制在代理空间上尝试不同的起始路径（第一次用初始 path，第二次用最近预测 path 等）。
+                               # 目的：用多次不同起点做优化，避免被某个糟糕的起点卡住
 
-            while True:
+            while True:        # ML-NEB 内层循环：在predicted landscape 上优化路径
 
                 if stationary_point_found is True:
                     self.n_images = org_n_images
 
-                starting_path = self.images  # Start from last path.
+                starting_path = self.images  # Start from last path.         
+                                             # 要传给 create_ml_neb 的起始 images。代码通过读取 all_predicted_paths.traj 的不同切片来恢复历史路径（0:n 或 -n:）。
 
                 if ml_cycles == 0:
                     sp = '0:' + str(self.n_images)
@@ -429,48 +453,62 @@ class MLNEB(object):
                                             gp=self.gp,
                                             scaling_targets=self.max_target,
                                             iteration=self.iter)
+                '''
+                这里 create_ml_neb 被传入 gp=self.gp：
+                意味着生成的 self.images 会带上 GP 的预测信息（例如把 GP 预测的能量/力写到 image 的 info 字段或更新 self.uncertainty_path、self.e_path）。
+                self.images 变成“带有 GP 预测和不确定度的路径”
+                '''
 
-                # Test before optimization:
+                # Test before optimization: 在优化前做测试（用 GP 预测检查不确定度）
 
-                for i in self.images:
+                for i in self.images: 
+                '''
+                对每个 image 调用 i.get_potential_energy() 会触发 GP 的预测
+                （因为这些 images 的 calculator/energy 可能被替换成 GP predictor 或 create_ml_neb 已把预测写入 image info）
+                '''
                     i.get_potential_energy()
-                    get_results_predicted_path(self)
-                    unc_ml = np.max(self.uncertainty_path[1:-1])
+                    get_results_predicted_path(self)               # 读取 GP 在整条路径上的预测结果、填充 self.e_path（预测能量数组）和 self.uncertainty_path（每张图片的不确定性），并计算其它派生量。
+                    unc_ml = np.max(self.uncertainty_path[1:-1])   # 取路径内部（不包括端点）的最大不确定性作为评估指标。
 
-                if unc_ml >= max_step:
+                if unc_ml >= max_step:                             # （不确定度太大），则提前停止当前 ML-NEB 内层循环（安全策略：predicted landscape 太不可靠无法继续优化）。
                     if self.fullout is True:
                         parprint('Maximum uncertainty reach in initial path.')
                         parprint('Early stop.')
                     break
 
-                # Perform NEB in the predicted landscape.
+                # Perform NEB in the predicted landscape. 在predicted landscape上用 NEB + MDMin 优化（cheap，因为用 GP 预测能量/力）
                 ml_neb = NEB(self.images, climb=True,
                              method=self.neb_method,
-                             k=self.spring)
-                if self.fullout is True:
+                             k=self.spring)                 # 用 ASE 的 NEB 对象构造 NEB 优化问题，climb=True 表示启用 climbing-image（用于准确寻找鞍点的增强策略）。
+                                                            # 但注意：这里的 self.images 能量/力是来自 GP 预测，而不是昂贵的 DFT。
+              if self.fullout is True:
                     parprint('Optimizing ML CI-NEB using dt:', dt)
-                neb_opt = MDMin(ml_neb, dt=dt, logfile=None)
+                neb_opt = MDMin(ml_neb, dt=dt, logfile=None) # MDMin：一种基于分子动力学的局部最小化器（模拟动力学然后能量最小化），用于优化 NEB。
                 if full_output is True:
                     neb_opt = MDMin(ml_neb, dt=dt)
 
+                # ML 优化循环（在predicted landscape上反复做小步并检测）
                 ml_converged = False
                 n_steps_performed = 0
                 while ml_converged is False:
                     # Save prev. positions:
                     prev_save_positions = []
 
-                    for i in self.images:
+                    for i in self.images:        # 先把当前所有 image 的位置保存到 prev_save_positions（便于在检测到错误时回退）。
                         prev_save_positions.append(i.get_positions())
 
-                    neb_opt.run(fmax=(fmax * 0.85), steps=1)
+                    neb_opt.run(fmax=(fmax * 0.85), steps=1)  # neb_opt.run(fmax=..., steps=1) 每次运行一步或几步。
+                                                              # 做一步 NEB 优化（在 GP 的预测力场上）。注意用 0.85×fmax 作为优化阈，表示在predicted landscape上稍微严格一些
                     neb_opt.nsteps = 0
 
                     n_steps_performed += 1
-                    get_results_predicted_path(self)
+                    get_results_predicted_path(self)          # 更新 n_steps_performed 并重新调用 get_results_predicted_path(self) 更新预测能量/uncertainty
                     unc_ml = np.max(self.uncertainty_path[1:-1])
-                    e_ml = np.max(self.e_path[1:-1])
+                    e_ml = np.max(self.e_path[1:-1])          # 路径内最大预测能量（用于判断是否预测出现异常高能）。
 
-                    if e_ml >= self.max_target + 0.2:
+
+                    # 安全检查 / 提前终止条件：
+                    if e_ml >= self.max_target + 0.2:         #（预测的路径能量高于端点能量尺度太多），说明 GP 在这个区域可能发散或出错 → 回退到 prev_save_positions 并结束 ML 优化循环（不把不可靠预测作为真实结果）
                         for i in range(0, self.n_images):
                             self.images[i].positions = prev_save_positions[i]
                         if self.fullout is True:
@@ -478,28 +516,32 @@ class MLNEB(object):
                                      'Early stop.')
                         ml_converged = True
 
-                    if unc_ml >= max_step:
+                    if unc_ml >= max_step:                    # （预测不确定性过大）→ 回退并结束 ML 优化循环
                         for i in range(0, self.n_images):
                             self.images[i].positions = prev_save_positions[i]
                         if self.fullout is True:
                             parprint('Maximum uncertainty reach. Early stop.')
                         ml_converged = True
-                    if neb_opt.converged():
+                    if neb_opt.converged():                   # 如果 neb_opt.converged() → 成功收敛于predicted landscape的局部极值 → ml_converged = True（结束循环并继续下一步流程）
                         ml_converged = True
 
-                    if np.isnan(ml_neb.emax):
+                    if np.isnan(ml_neb.emax):                 # 如果 NEB 的最大能量出现 NaN（数值不稳定），则把 images 恢复为之前保存到磁盘的路径，设置 n_steps_performed=10000（强制跳出并触发失败路径）。
                         sp = str(-self.n_images) + ':'
                         self.images = read('./all_predicted_paths.traj', sp)
                         for i in self.images:
                             i.get_potential_energy()
                         n_steps_performed = 10000
 
-                    if n_steps_performed > ml_steps-1:
+                    if n_steps_performed > ml_steps-1:         # 如果循环步数超过 ml_steps 限制，也终止（安全上限）。
                         if self.fullout is True:
                             parprint('Not converged yet...')
                         ml_converged = True
 
-                if n_steps_performed <= ml_steps-1:
+                    '''
+                    以上，整体目的：在 cheap 的 GP 势上尽量把路径优化到稳定状态（节省真实计算），但每步都做严格安全检查以免 GP 的错误预测导致误导。
+                    '''
+
+                if n_steps_performed <= ml_steps-1:  # 已经在predicted landscape上成功优化（或提前安全停），跳出内层循环
                     if self.fullout is True:
                         parprint('Converged opt. in the predicted landscape.')
                     break
@@ -508,11 +550,15 @@ class MLNEB(object):
                 if self.fullout is True:
                     parprint('ML cycles performed:', ml_cycles)
 
-                if ml_cycles == 2:
+                if ml_cycles == 2:                    # 多次 ML 优化失败 → 放弃当前设置，退出内层循环
+                '''
+                若在允许步数内收敛成功（或通过早停安全退出），跳出内层循环；ml_cycles 控制尝试次数，若尝试太多次仍不可行，则认为 ML 流程不可靠（可能需要换插值或镜像数），于是放弃（防止死循环）。
+                '''
                     if self.fullout is True:
                         parprint('ML process not optimized...not safe...')
                         parprint('Change interpolation or numb. of images.')
                     break
+                  
 
             # 3. Get results from ML NEB using ASE NEB Tools:
             # See https://wiki.fysik.dtu.dk/ase/ase/neb.html
