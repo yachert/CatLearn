@@ -1,4 +1,13 @@
 """Functions to make predictions with Gaussian Processes machine learning."""
+'''
+GaussianProcess 是 CatLearn 中的 GP 实现，用来做 能量/力（或任意目标）回归，支持：
+用 特征向量（fingerprints） 作为输入；
+同时把 能量（target）和梯度（forces） 作为训练信息（若提供 gradients）；
+自定义核（kernel_list）（多个子核组合）并支持超参数优化（基于对数边际似然或其他损失）；
+提供 predict(...)（返回均值）和 predict(..., uncertainty=True)（返回不确定度）；
+支持 scale_data（对特征与 target 做标准化），并能以 update_data 高效更新训练集；
+直接计算并存储 Gram（协方差）矩阵的逆 cinv，用于高效预测。
+'''
 from __future__ import absolute_import
 from __future__ import division
 
@@ -7,11 +16,11 @@ from scipy.optimize import minimize, basinhopping
 from collections import defaultdict
 import functools
 import warnings
-from .gpfunctions.log_marginal_likelihood import log_marginal_likelihood
+from .gpfunctions.log_marginal_likelihood import log_marginal_likelihood  # 最大对数边际似然(LML)
 from .gpfunctions.covariance import get_covariance
 from .gpfunctions.kernel_setup import prepare_kernels, kdicts2list, list2kdict
-from .gpfunctions.uncertainty import get_uncertainty
-from .gpfunctions.default_scale import ScaleData
+from .gpfunctions.uncertainty import get_uncertainty 
+from .gpfunctions.default_scale import ScaleData # 如果 scale_data=True，会对训练输入/输出做标准化（对数或线性标准化由实现决定）
 from .cost_function import get_error, _cost_function
 
 
@@ -22,6 +31,15 @@ class GaussianProcess(object):
                  regularization=None, regularization_bounds=None,
                  optimize_hyperparameters=False, scale_optimizer=False,
                  scale_data=False):
+        # 参数与初始化流程（重点：形状/含义）
+        # train_fp：训练特征，二维结构。常见形状 (M, D)：M = 训练点数，D = 每点特征维度。函数最开始用 assert np.shape(train_fp)[0] == len(train_target) 检查样本数一致。
+        # train_target：训练目标（e.g. 能量），通常 (M,) 或 (M,1)。
+        # gradients：可选。若提供，说明你同时有每个训练点的导数信息（例如每点的力）。形状通常 (M, 3N)（扁平化）或能被转换为一维向量追加到目标上（见下文 how they append）。
+        # kernel_list：一组 kernel 配置（list of dict），由 prepare_kernels 解析成内部用的 self.kernel_list 和 self.bounds（优化边界）。
+                    #  每个 kernel dict 包含 'type', 'width'/'lengthscale', 'scaling' 等超参数。
+        # regularization：协方差矩阵的对角正则化项（jitter/noise）
+        # regularization_bounds：超参优化时 regularization 的上下界。若 gradients 存在，默认 bounds 更保守（(1e-3, 1e3)）
+        # optimize_hyperparameters：若 True，在构造时会调用 optimize_hyperparameters() 做超参优化。
         """Gaussian processes setup.
 
         Parameters
@@ -56,10 +74,10 @@ class GaussianProcess(object):
         msg = 'The number of data does not match the number of targets.'
         assert np.shape(train_fp)[0] == len(train_target), msg
 
-        _, self.N_D = np.shape(train_fp)
-        self.regularization = regularization
-        self.gradients = gradients
-        self.scale_optimizer = scale_optimizer
+        _, self.N_D = np.shape(train_fp)       # self.N_D = D（特征维度）
+        self.regularization = regularization   # 协方差矩阵的对角正则化项（jitter/noise）
+        self.gradients = gradients             # 若提供，说明你同时有每个训练点的导数信息（例如每点的力）
+        self.scale_optimizer = scale_optimizer 
         self.scale_data = scale_data
 
         # Set flag for evaluating gradients.
@@ -77,13 +95,20 @@ class GaussianProcess(object):
             kernel_list, regularization_bounds=regularization_bounds,
             eval_gradients=self.eval_gradients, N_D=self.N_D
         )
+        # self.kernel_list、self.bounds = prepare_kernels(...) 输出
 
         self.update_data(train_fp, train_target, gradients=self.gradients,
                          scale_optimizer=scale_optimizer)
+        # self.update_data(train_fp, train_target, gradients=...) 被调用，构造 Gram 矩阵并求逆（self.cinv），并计算初始 LML（若 target 存在）
 
         if optimize_hyperparameters:
             self.optimize_hyperparameters()
+        
 
+    # ====================================
+    # （最关键的 API）用已经训练好的 GP（当前对象保存的 self.cinv、self.train_fp、self.train_target、self.kernel_list 等）对 测试集特征 test_fp 给出 预测均值（posterior mean），
+    #  并可选地给出 不确定度（posterior std）、训练/验证误差、以及基于固定基函数的修正预测。
+    #  self.eval_gradients：是否在训练时使用了梯度（若 True，矩阵尺寸更复杂）。
     def predict(self, test_fp, test_target=None, uncertainty=False, basis=None,
                 get_validation_error=False, get_training_error=False,
                 epsilon=None):
@@ -93,7 +118,7 @@ class GaussianProcess(object):
         ----------
         test_fp : list
             A list of testing fingerprint vectors.
-        test_target : list
+        test_target : list 训练目标值（如能量）
             A list of the the test targets used to generate the prediction
             errors.
         uncertainty : boolean
@@ -131,7 +156,7 @@ class GaussianProcess(object):
             assert test_target is not None, msg
 
         # Enforce np.array type for test data.
-        test_fp = np.asarray(test_fp)
+        test_fp = np.asarray(test_fp)  # test_fp 最终是 numpy.ndarray，shape (n_test, D)。如果 scale_data，使用相同的标准化（同训练）变换。前面的是train_fp
         if self.scale_data:
             test_fp = self.scaling.test(test_fp)
         if test_target is not None:
@@ -140,23 +165,39 @@ class GaussianProcess(object):
         # Store input data.
         data = defaultdict(list)
 
+        # ===========诶哟我天呐，太关键了
+        # ktb 表示 K∗X：测试点（rows）与训练点（cols）之间的协方差。
+        # 形状：通常 (n_test, n_train)。
+        # 如果 eval_gradients=True（即训练中包含梯度/forces），get_covariance 会返回扩展的协方差，可能包含 block 结构，对应能量-能量、能量-力、力-能量和力-力 的交叉协方差。
+        # 形状将变为 (n_test_blocks, n_train_blocks)，具体取决于其内部如何展平梯度（这点可以用 ktb.shape 打印验证）。
         # Calculate the covariance between the test and training datasets.
         ktb = get_covariance(kernel_list=self.kernel_list, matrix1=test_fp,
                              matrix2=self.train_fp, regularization=None,
                              log_scale=self.scale_optimizer,
-                             eval_gradients=self.eval_gradients)
+                             eval_gradients=self.eval_gradients) # self.eval_gradients：是否在训练时使用了梯度（若 True，矩阵尺寸更复杂）。
+        # =============
 
-        # Build the list of predictions.
+        # Build the list of predictions. 预测均值
+        # 𝛼=𝐶inv⋅𝑦（这里 target 为训练目标向量 y，shape (n_train,1)）
+        #𝑓^∗=𝐾∗𝑋⋅𝛼 返回 pred（预测均值），其 数学公式是标准 GP 的后验均值公式：
+        # 𝜇∗=𝐾∗𝑋 𝐾𝑋𝑋−1𝑦
+        # 形状：pred 的 shape 通常是 (n_test, 1) 或 (n_test,)（取决实现）；在代码中 pred 最后如果 self.scale_data 会 rescale_targets(pred)。
         data['prediction'] = self._make_prediction(ktb=ktb, cinv=self.cinv,
                                                    target=self.train_target)
+        
 
         # Calculate error associated with predictions on the test data.
+        # Calculate error associated with predictions on the training data. 计算训练 / 验证误差（可选）
+        # 如果 get_validation_error：使用 get_error(prediction=data['prediction'], target=test_target, epsilon=epsilon) 计算误差指标（例如 RMSE、MAE）；返回 data['validation_error']（字典，含具体指标）。
+        # 如果 get_training_error：先构造 kt_train = get_covariance(..., matrix1=self.train_fp) = K_{XX}，然后 train_prediction = _make_prediction(ktb=kt_train, cinv=self.cinv, target=self.train_target) (即在训练点处的预测)，再用 get_error 比较训练目标与 train_prediction。
+        # 注：在数值上，train_prediction 理论上等于训练 targets（如果无噪声并且数值精确），但由于 regularization/数值/scale 可能有差异，因此返回训练误差来评估拟合质量。
+
         if get_validation_error:
             data['validation_error'] = get_error(prediction=data['prediction'],
                                                  target=test_target,
                                                  epsilon=epsilon)
 
-        # Calculate error associated with predictions on the training data.
+            
         if get_training_error:
             # Calculate the covariance between the training dataset.
             kt_train = get_covariance(
@@ -188,14 +229,15 @@ class GaussianProcess(object):
             )
 
             data['uncertainty_with_reg'] = data['uncertainty'] + \
-                self.regularization
+                self.regularization # uncertainty_with_reg 在结果上额外加上 self.regularization（把正则/噪声项加回到不确定度上，表征观测噪声或模型不确定性下限）。
 
             # Rescale uncertainty if needed.
             if self.scale_data:
                 data['uncertainty'] *= self.scaling.target_data['std']
                 data['uncertainty_with_reg'] *= self.scaling.target_data['std']
-
-        if basis is not None:
+                
+        # 简单理解：basis 让你在 GP 均值上加上 线性/非线性可解释项，这对于不确定度评估和归纳性能有帮助（例如去掉趋势后 GP 更专注建模残差，从而不确定度估计更可靠）。
+        if basis is not None: # 在 GP 的基础上再拟合一个基函数（比如线性项、已知的物理趋势等），把 GP 用来建模残差，而不是直接建模全部信号。
             data['basis'] = self._fixed_basis(
                 train=self.train_fp, test=test_fp, ktb=ktb, cinv=self.cinv,
                 target=self.train_target, test_target=test_target, basis=basis,
@@ -204,6 +246,7 @@ class GaussianProcess(object):
 
         return data
 
+    # ==============================================
     def predict_uncertainty(self, test_fp):
         """Return uncertainty only.
 
@@ -252,9 +295,31 @@ class GaussianProcess(object):
         scale_optimizer : boolean
             Flag to define if the hyperparameters are log scale for
             optimization.
+
+            
+        形状检查：d, f = np.shape(train_fp)，并断言 f == self.N_D（特征维度一致）。
+        存储训练特征/目标：self.train_fp = np.asarray(train_fp)；若 train_target 非空则 self.train_target = np.asarray(train_target)。
+        scale_data 分支（若 self.scale_data=True）：
+        创建 self.scaling = ScaleData(train_fp, train_target)，并对 train_fp, train_target = self.scaling.train() 标准化。
+
+        若提供 gradients，按照缩放比例对梯度做等比例缩放：gradients = gradients / (std_target / std_feature)，并 ravel 成一维追加到目标（因为联合训练能量+梯度时常把梯度作为额外目标项拼接）。
+
+        若既有 gradients 又有 train_target：把 gradients flatten 后用 np.append 拼接到 self.train_target，并 reshape 成列向量。
+
+        这一步很关键：实现把能量和梯度串接成一个长的目标向量，形式上是把能量条目在前、所有梯度条目在后（具体排列顺序取决实现）。这允许在 Gram 矩阵里同时表示能量-能量、能量-力、力-力的协方差块。
+
+        构造 Gram 矩阵：cvm = get_covariance(kernel_list=..., matrix1=self.train_fp, regularization=self.regularization, log_scale=scale_optimizer, eval_gradients=self.eval_gradients)。
+
+        这一步会根据 kernel_list 构造训练点之间（以及若 eval_gradients=True 时，能量与力之间）的完整协方差矩阵（通常大小 = M*(1+3N?)，视实现如何展平梯度）。
+
+        求逆：self.cinv = np.linalg.inv(cvm)。
+
+        注意：直接求逆是数值/性能上不优的（应该用 Cholesky + solve），但这里实现直接用 inv。若矩阵接近奇异，会出错。self.regularization 就是用来保证正定性的。
+
+        若有 train_target，则调用 _update_lml() 计算 log marginal likelihood 并保存，否则警告“GP mean not updated”。
         """
         # Get the shape of the training dataset.
-        d, f = np.shape(train_fp)
+        d, f = np.shape(train_fp) # train_fp：训练特征，二维结构。常见形状 (M, D)：M = 训练点数，D = 每点特征维度。函数最开始用 assert np.shape(train_fp)[0] == len(train_target) 检查样本数一致。
 
         # Perform some sanity checks.
         if self.N_D != f:
@@ -270,32 +335,37 @@ class GaussianProcess(object):
             self.train_target = np.asarray(train_target)
 
         if self.scale_data:
-            self.scaling = ScaleData(train_fp, train_target)
+            self.scaling = ScaleData(train_fp, train_target) # 对 train_fp, train_target = self.scaling.train() 标准化
             self.train_fp, self.train_target = self.scaling.train()
             if gradients is not None:
                 gradients = gradients / (self.scaling.target_data['std'] /
                                          self.scaling.feature_data['std'])
-                gradients = np.ravel(gradients)
+                gradients = np.ravel(gradients) # 若提供 gradients，按照缩放比例对梯度做等比例缩放：gradients = gradients / (std_target / std_feature)，并 ravel 成一维追加到目标（因为联合训练能量+梯度时常把梯度作为额外目标项拼接）。
 
-        if gradients is not None and train_target is not None:
+        if gradients is not None and train_target is not None: 
+            # 若既有 gradients 又有 train_target：把 gradients flatten 后用 np.append 拼接到 self.train_target，并 reshape 成列向量。
+            # 这一步很关键：实现把能量和梯度串接成一个长的目标向量，形式上是把能量条目在前、所有梯度条目在后（具体排列顺序取决实现）。这允许在 Gram 矩阵里同时表示能量-能量、能量-力、力-力的协方差块。
             train_target_grad = np.append(self.train_target, gradients)
             self.train_target = np.reshape(train_target_grad,
                                            (np.shape(train_target_grad)[0], 1))
 
         # Get the Gram matrix on-the-fly if none is suppiled.
+        # 这一步会根据 kernel_list 构造训练点之间（以及若 eval_gradients=True 时，能量与力之间）的完整协方差矩阵（通常大小 = M*(1+3N?)，视实现如何展平梯度）。
         cvm = get_covariance(
             kernel_list=self.kernel_list, matrix1=self.train_fp,
             regularization=self.regularization, log_scale=scale_optimizer,
             eval_gradients=self.eval_gradients)
 
-        # Invert the covariance matrix.
+        # Invert the covariance matrix. 求逆：
+        # 注意：直接求逆是数值/性能上不优的（应该用 Cholesky + solve），但这里实现直接用 inv。若矩阵接近奇异，会出错。self.regularization 就是用来保证正定性的。
         self.cinv = np.linalg.inv(cvm)
-        if train_target is None:
+        if train_target is None: # 若有 train_target，则调用 _update_lml() 计算 log marginal likelihood 并保存，否则警告“GP mean not updated”。
             warnings.warn("GP mean not updated.")
             self.log_marginal_likelihood = np.nan
         else:
             self._update_lml()
-
+            
+    # ===============================（超参数优化）
     def optimize_hyperparameters(self, global_opt=False, algomin='L-BFGS-B',
                                  eval_jac=False, loss_function='lml'):
         """Optimize hyperparameters of the Gaussian Process.
@@ -314,7 +384,7 @@ class GaussianProcess(object):
             Define scipy minimizer method to call. Default is L-BFGS-B.
         """
         # Create a list of all hyperparameters.
-        theta = kdicts2list(self.kernel_list, N_D=self.N_D)
+        theta = kdicts2list(self.kernel_list, N_D=self.N_D) # 把 kernel_list 的所有可优化超参打平成向量 theta
         theta = np.append(theta, self.regularization)
 
         if loss_function == 'lml':
@@ -412,7 +482,7 @@ class GaussianProcess(object):
         else:
             self._update_lml()
 
-    def _make_prediction(self, ktb, cinv, target):
+    def _make_prediction(self, ktb, cinv, target): # （矩阵运算的核心）
         """Function to make the prediction.
 
         Parameters
@@ -430,8 +500,11 @@ class GaussianProcess(object):
             The predictions for the test data.
         """
         # Form list of the actual predictions.
-        alpha = functools.reduce(np.dot, (cinv, target))
+        # 这是标准 GP 的闭式解（在给定核与协方差逆的情况下），复杂性集中在 cinv 的计算/稳定性。
 
+        # # Step 1: 计算权重向量 α = [K + σ²I]^(-1) · y
+        alpha = functools.reduce(np.dot, (cinv, target)) 
+        # # Step 2: 预测均值 = K(X*, X) · α
         pred = functools.reduce(np.dot, (ktb, alpha))
 
         if self.scale_data:
